@@ -2,6 +2,12 @@
 **/artifacts/
 **/artifacts/**
 
+# Hardhat artifacts / cache
+cache/
+
+# Node / JS tooling
+node_modules/
+
 # Remix plugin state folders
 deps/
 states/

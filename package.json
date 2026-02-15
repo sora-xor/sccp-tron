@@ -1,0 +1,18 @@
+{
+  "name": "sccp-tron",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "encode-attester-proof": "node ./scripts/encode_attester_quorum_proof.mjs"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^4.0.4",
+    "@nomicfoundation/hardhat-mocha": "^3.0.9",
+    "chai": "^5.3.3",
+    "ethers": "^6.16.0",
+    "hardhat": "^3.1.8",
+    "mocha": "^11.0.0"
+  }
+}
