@@ -58,6 +58,154 @@ function merkleProofForIndex(layers, leafIndex) {
 }
 
 describe('SORA BEEFY+MMR light client verifier (EVM)', function () {
+  it('fails closed before initialize and protects only-self internal verifier path', async function () {
+    const { ethers } = await network.connect();
+    const [governor] = await ethers.getSigners();
+
+    const Verifier = await ethers.getContractFactory('SoraBeefyLightClientVerifier');
+    const verifier = await Verifier.deploy(governor.address);
+    await verifier.waitForDeployment();
+
+    const ok = await verifier.verifyBurnProof(0, ethers.ZeroHash, '0x', '0x');
+    expect(ok).to.equal(false);
+
+    await expectCustomError(
+      verifier._verifyBurnProofInternal(ethers.ZeroHash, '0x'),
+      verifier,
+      'OnlySelf',
+    );
+  });
+
+  it('enforces governor checks and initialize lifecycle guards', async function () {
+    const { ethers } = await network.connect();
+    const [governor, user] = await ethers.getSigners();
+
+    const Verifier = await ethers.getContractFactory('SoraBeefyLightClientVerifier');
+    const verifier = await Verifier.deploy(governor.address);
+    await verifier.waitForDeployment();
+
+    await expectCustomError(
+      verifier.connect(user).setGovernor(user.address),
+      verifier,
+      'OnlyGovernor',
+    );
+    await expectCustomError(
+      verifier.connect(governor).setGovernor(ethers.ZeroAddress),
+      verifier,
+      'ZeroAddress',
+    );
+
+    const validators = [0, 1, 2, 3].map(() => ethers.Wallet.createRandom());
+    const leafHashes = validators.map((w) => ethers.keccak256(ethers.getBytes(w.address)));
+    const { root: vsetRoot } = merkleTreeFromLeaves(ethers, leafHashes);
+
+    const currentVset = { id: 1n, len: 4, root: vsetRoot };
+    const nextVset = { id: 2n, len: 4, root: vsetRoot };
+
+    const leaf = {
+      version: 0,
+      parentNumber: 1,
+      parentHash: ethers.keccak256('0x01'),
+      nextAuthoritySetId: 2n,
+      nextAuthoritySetLen: 4,
+      nextAuthoritySetRoot: vsetRoot,
+      randomSeed: ethers.keccak256('0x02'),
+      digestHash: ethers.keccak256('0x00'),
+    };
+    const validatorProof = {
+      signatures: [],
+      positions: [],
+      publicKeys: [],
+      publicKeyMerkleProofs: [],
+    };
+    const mmrProof = { leafIndex: 0n, leafCount: 1n, items: [] };
+
+    await expectCustomError(
+      verifier.submitSignatureCommitment(
+        { mmrRoot: ethers.keccak256('0x03'), blockNumber: 1, validatorSetId: 1n },
+        validatorProof,
+        leaf,
+        mmrProof,
+      ),
+      verifier,
+      'NotInitialized',
+    );
+
+    await (await verifier.connect(governor).initialize(10n, currentVset, nextVset)).wait();
+    await expectCustomError(
+      verifier.connect(governor).initialize(10n, currentVset, nextVset),
+      verifier,
+      'AlreadyInitialized',
+    );
+
+    await expectCustomError(
+      verifier.submitSignatureCommitment(
+        { mmrRoot: ethers.keccak256('0x04'), blockNumber: 10, validatorSetId: 1n },
+        validatorProof,
+        leaf,
+        mmrProof,
+      ),
+      verifier,
+      'PayloadBlocknumberTooOld',
+    );
+
+    await expectCustomError(
+      verifier.submitSignatureCommitment(
+        { mmrRoot: ethers.keccak256('0x05'), blockNumber: 11, validatorSetId: 999n },
+        validatorProof,
+        leaf,
+        mmrProof,
+      ),
+      verifier,
+      'InvalidValidatorSetId',
+    );
+  });
+
+  it('verifyBurnProof fails closed on message-id mismatch and malformed proof bytes', async function () {
+    const { ethers } = await network.connect();
+    const [governor, user] = await ethers.getSigners();
+
+    const DOMAIN_SORA = 0;
+    const DOMAIN_TRON = 5;
+
+    const CodecTest = await ethers.getContractFactory('SccpCodecTest');
+    const codec = await CodecTest.deploy();
+    await codec.waitForDeployment();
+
+    const Verifier = await ethers.getContractFactory('SoraBeefyLightClientVerifier');
+    const verifier = await Verifier.deploy(governor.address);
+    await verifier.waitForDeployment();
+
+    const validators = [0, 1, 2, 3].map(() => ethers.Wallet.createRandom());
+    const leafHashes = validators.map((w) => ethers.keccak256(ethers.getBytes(w.address)));
+    const { root: vsetRoot } = merkleTreeFromLeaves(ethers, leafHashes);
+    await (
+      await verifier.initialize(
+        0n,
+        { id: 1n, len: 4, root: vsetRoot },
+        { id: 2n, len: 4, root: vsetRoot },
+      )
+    ).wait();
+
+    const soraAssetId = `0x${'11'.repeat(32)}`;
+    const payload = await codec.encodeBurnPayloadV1(
+      DOMAIN_SORA,
+      DOMAIN_TRON,
+      1,
+      soraAssetId,
+      1,
+      ethers.zeroPadValue(user.address, 32),
+    );
+    const messageId = await codec.burnMessageId(payload);
+
+    expect(
+      await verifier.verifyBurnProof(DOMAIN_SORA, ethers.ZeroHash, payload, '0x'),
+    ).to.equal(false);
+    expect(
+      await verifier.verifyBurnProof(DOMAIN_SORA, messageId, payload, '0x1234'),
+    ).to.equal(false);
+  });
+
   it('imports an MMR root and verifies a SORA-attested burn proof end-to-end (any source domain)', async function () {
     const { ethers } = await network.connect();
     const [governor, user] = await ethers.getSigners();
