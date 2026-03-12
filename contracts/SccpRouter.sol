@@ -7,10 +7,8 @@ import "./SccpToken.sol";
 
 /// @notice SCCP router for EVM chains.
 ///
-/// Users burn wrapped tokens on this chain to create an on-chain burn record + message id.
-/// A target chain can later verify the burn via an on-chain verifier (light client) and mint.
-///
-/// This contract is intentionally fail-closed until a proper verifier is configured.
+/// Burns and mints are permissionless, while token lifecycle controls (add/pause/resume)
+/// are driven only by SORA-finalized BEEFY proofs.
 contract SccpRouter {
     using SccpCodec for bytes;
 
@@ -23,9 +21,10 @@ contract SccpRouter {
     uint32 public constant DOMAIN_TRON = 5;
 
     error ZeroAddress();
-    error OnlyGovernor();
     error TokenAlreadyRegistered();
     error TokenNotRegistered();
+    error TokenNotActive();
+    error TokenNotPaused();
     error AmountIsZero();
     error RecipientIsZero();
     error DomainUnsupported();
@@ -34,21 +33,24 @@ contract SccpRouter {
     error BurnRecordAlreadyExists();
     error BurnRecordNotFound();
     error InboundAlreadyProcessed();
-    error InboundDomainPaused();
-    error OutboundDomainPaused();
-    error ProofInvalidated();
+    error GovernanceActionAlreadyProcessed();
     error ProofVerificationFailed();
-    error VerifierNotSet();
     error AmountTooLarge();
     error RecipientNotCanonical();
+    error InvalidGovernancePayload();
+    error TokenMetadataInvalid();
 
-    event GovernorSet(address indexed governor);
-    event VerifierSet(address indexed verifier);
+    enum TokenState {
+        None,
+        Active,
+        Paused
+    }
 
-    event TokenDeployed(bytes32 indexed soraAssetId, address token, uint8 decimals);
-    event InboundDomainPausedSet(uint32 indexed sourceDomain, bool paused);
-    event OutboundDomainPausedSet(uint32 indexed destDomain, bool paused);
-    event InboundMessageInvalidated(uint32 indexed sourceDomain, bytes32 indexed messageId, bool invalidated);
+    event VerifierConfigured(address indexed verifier);
+
+    event TokenAddedByProof(bytes32 indexed messageId, bytes32 indexed soraAssetId, address token, uint8 decimals);
+    event TokenPausedByProof(bytes32 indexed messageId, bytes32 indexed soraAssetId);
+    event TokenResumedByProof(bytes32 indexed messageId, bytes32 indexed soraAssetId);
 
     event SccpBurned(
         bytes32 indexed messageId,
@@ -61,12 +63,7 @@ contract SccpRouter {
         bytes payload
     );
 
-    event SccpMinted(
-        bytes32 indexed messageId,
-        bytes32 indexed soraAssetId,
-        address indexed recipient,
-        uint128 amount
-    );
+    event SccpMinted(bytes32 indexed messageId, bytes32 indexed soraAssetId, address indexed recipient, uint128 amount);
 
     struct BurnRecord {
         address sender;
@@ -79,56 +76,23 @@ contract SccpRouter {
     }
 
     uint32 public immutable localDomain;
-
-    address public governor;
-    ISccpVerifier public verifier;
+    ISccpVerifier public immutable verifier;
 
     uint64 public outboundNonce;
 
     mapping(bytes32 => address) public tokenBySoraAssetId;
+    mapping(bytes32 => TokenState) public tokenStateBySoraAssetId;
     mapping(bytes32 => BurnRecord) public burns;
 
     mapping(bytes32 => bool) public processedInbound;
-    mapping(uint32 => bool) public inboundDomainPaused;
-    mapping(uint32 => bool) public outboundDomainPaused;
-    mapping(uint32 => mapping(bytes32 => bool)) public invalidatedInbound;
+    mapping(bytes32 => bool) public processedGovernanceMessage;
 
-    modifier onlyGovernor() {
-        if (msg.sender != governor) revert OnlyGovernor();
-        _;
-    }
-
-    constructor(uint32 localDomain_, address governor_) {
-        if (governor_ == address(0)) revert ZeroAddress();
+    constructor(uint32 localDomain_, address verifier_) {
+        if (verifier_ == address(0)) revert ZeroAddress();
         _ensure_supported_domain(localDomain_);
         localDomain = localDomain_;
-        governor = governor_;
-        emit GovernorSet(governor_);
-    }
-
-    function setGovernor(address newGovernor) external onlyGovernor {
-        if (newGovernor == address(0)) revert ZeroAddress();
-        governor = newGovernor;
-        emit GovernorSet(newGovernor);
-    }
-
-    function setVerifier(address verifier_) external onlyGovernor {
         verifier = ISccpVerifier(verifier_);
-        emit VerifierSet(verifier_);
-    }
-
-    /// @notice Deploy and register a wrapped token for a given SORA asset id.
-    function deployToken(
-        bytes32 soraAssetId,
-        string calldata name,
-        string calldata symbol,
-        uint8 decimals
-    ) external onlyGovernor returns (address token) {
-        if (tokenBySoraAssetId[soraAssetId] != address(0)) revert TokenAlreadyRegistered();
-        SccpToken t = new SccpToken(name, symbol, decimals, address(this));
-        token = address(t);
-        tokenBySoraAssetId[soraAssetId] = token;
-        emit TokenDeployed(soraAssetId, token, decimals);
+        emit VerifierConfigured(verifier_);
     }
 
     /// @notice Burn wrapped tokens on this chain to create a burn message for `destDomain`.
@@ -143,7 +107,6 @@ contract SccpRouter {
         if (recipient == bytes32(0)) revert RecipientIsZero();
         if (destDomain == localDomain) revert DomainEqualsLocal();
         _ensure_supported_domain(destDomain);
-        if (outboundDomainPaused[destDomain]) revert OutboundDomainPaused();
 
         // If the destination is an EVM chain, enforce canonical encoding:
         // address right-aligned in 32 bytes and non-zero.
@@ -154,6 +117,7 @@ contract SccpRouter {
 
         address token = tokenBySoraAssetId[soraAssetId];
         if (token == address(0)) revert TokenNotRegistered();
+        if (tokenStateBySoraAssetId[soraAssetId] != TokenState.Active) revert TokenNotActive();
 
         if (outboundNonce == type(uint64).max) revert NonceOverflow();
         outboundNonce += 1;
@@ -207,15 +171,11 @@ contract SccpRouter {
     }
 
     /// @notice Mint wrapped tokens on this chain based on a verified burn on `sourceDomain`.
-    /// @dev Fail-closed until `verifier` is set to an on-chain light client / verifier.
     function mintFromProof(uint32 sourceDomain, bytes calldata payload, bytes calldata proof) external {
-        if (address(verifier) == address(0)) revert VerifierNotSet();
         _ensure_supported_domain(sourceDomain);
         if (sourceDomain == localDomain) revert DomainEqualsLocal();
-        if (inboundDomainPaused[sourceDomain]) revert InboundDomainPaused();
 
         bytes32 messageId = SccpCodec.burnMessageId(payload);
-        if (invalidatedInbound[sourceDomain][messageId]) revert ProofInvalidated();
         if (processedInbound[messageId]) revert InboundAlreadyProcessed();
 
         SccpCodec.BurnPayloadV1 memory p = SccpCodec.decodeBurnPayloadV1(payload);
@@ -227,6 +187,7 @@ contract SccpRouter {
 
         address token = tokenBySoraAssetId[p.soraAssetId];
         if (token == address(0)) revert TokenNotRegistered();
+        if (tokenStateBySoraAssetId[p.soraAssetId] != TokenState.Active) revert TokenNotActive();
 
         bool ok = verifier.verifyBurnProof(sourceDomain, messageId, payload, proof);
         if (!ok) revert ProofVerificationFailed();
@@ -241,25 +202,70 @@ contract SccpRouter {
         emit SccpMinted(messageId, p.soraAssetId, recipient, p.amount);
     }
 
-    function setInboundDomainPaused(uint32 sourceDomain, bool paused) external onlyGovernor {
-        if (sourceDomain == localDomain) revert DomainEqualsLocal();
-        _ensure_supported_domain(sourceDomain);
-        inboundDomainPaused[sourceDomain] = paused;
-        emit InboundDomainPausedSet(sourceDomain, paused);
+    /// @notice Add and activate a token mapping based on a SORA-finalized governance proof.
+    function addTokenFromProof(bytes calldata payload, bytes calldata proof) external returns (address token) {
+        bytes32 messageId = SccpCodec.tokenAddMessageId(payload);
+        if (processedGovernanceMessage[messageId]) revert GovernanceActionAlreadyProcessed();
+
+        SccpCodec.TokenAddPayloadV1 memory p = SccpCodec.decodeTokenAddPayloadV1(payload);
+        if (p.version != 1) revert InvalidGovernancePayload();
+        if (p.targetDomain != localDomain) revert DomainUnsupported();
+        if (tokenBySoraAssetId[p.soraAssetId] != address(0)) revert TokenAlreadyRegistered();
+
+        bool ok = verifier.verifyTokenAddProof(messageId, payload, proof);
+        if (!ok) revert ProofVerificationFailed();
+
+        string memory name = _bytes32ToString(p.name);
+        string memory symbol = _bytes32ToString(p.symbol);
+        if (bytes(name).length == 0 || bytes(symbol).length == 0) revert TokenMetadataInvalid();
+
+        SccpToken t = new SccpToken(name, symbol, p.decimals, address(this));
+        token = address(t);
+        tokenBySoraAssetId[p.soraAssetId] = token;
+        tokenStateBySoraAssetId[p.soraAssetId] = TokenState.Active;
+        processedGovernanceMessage[messageId] = true;
+
+        emit TokenAddedByProof(messageId, p.soraAssetId, token, p.decimals);
     }
 
-    function setOutboundDomainPaused(uint32 destDomain, bool paused) external onlyGovernor {
-        if (destDomain == localDomain) revert DomainEqualsLocal();
-        _ensure_supported_domain(destDomain);
-        outboundDomainPaused[destDomain] = paused;
-        emit OutboundDomainPausedSet(destDomain, paused);
+    /// @notice Pause a registered token based on a SORA-finalized governance proof.
+    function pauseTokenFromProof(bytes calldata payload, bytes calldata proof) external {
+        bytes32 messageId = SccpCodec.tokenPauseMessageId(payload);
+        if (processedGovernanceMessage[messageId]) revert GovernanceActionAlreadyProcessed();
+
+        SccpCodec.TokenControlPayloadV1 memory p = SccpCodec.decodeTokenPausePayloadV1(payload);
+        if (p.version != 1) revert InvalidGovernancePayload();
+        if (p.targetDomain != localDomain) revert DomainUnsupported();
+        if (tokenBySoraAssetId[p.soraAssetId] == address(0)) revert TokenNotRegistered();
+        if (tokenStateBySoraAssetId[p.soraAssetId] != TokenState.Active) revert TokenNotActive();
+
+        bool ok = verifier.verifyTokenPauseProof(messageId, payload, proof);
+        if (!ok) revert ProofVerificationFailed();
+
+        tokenStateBySoraAssetId[p.soraAssetId] = TokenState.Paused;
+        processedGovernanceMessage[messageId] = true;
+
+        emit TokenPausedByProof(messageId, p.soraAssetId);
     }
 
-    function invalidateInboundMessage(uint32 sourceDomain, bytes32 messageId, bool invalidated) external onlyGovernor {
-        if (sourceDomain == localDomain) revert DomainEqualsLocal();
-        _ensure_supported_domain(sourceDomain);
-        invalidatedInbound[sourceDomain][messageId] = invalidated;
-        emit InboundMessageInvalidated(sourceDomain, messageId, invalidated);
+    /// @notice Resume a paused token based on a SORA-finalized governance proof.
+    function resumeTokenFromProof(bytes calldata payload, bytes calldata proof) external {
+        bytes32 messageId = SccpCodec.tokenResumeMessageId(payload);
+        if (processedGovernanceMessage[messageId]) revert GovernanceActionAlreadyProcessed();
+
+        SccpCodec.TokenControlPayloadV1 memory p = SccpCodec.decodeTokenResumePayloadV1(payload);
+        if (p.version != 1) revert InvalidGovernancePayload();
+        if (p.targetDomain != localDomain) revert DomainUnsupported();
+        if (tokenBySoraAssetId[p.soraAssetId] == address(0)) revert TokenNotRegistered();
+        if (tokenStateBySoraAssetId[p.soraAssetId] != TokenState.Paused) revert TokenNotPaused();
+
+        bool ok = verifier.verifyTokenResumeProof(messageId, payload, proof);
+        if (!ok) revert ProofVerificationFailed();
+
+        tokenStateBySoraAssetId[p.soraAssetId] = TokenState.Active;
+        processedGovernanceMessage[messageId] = true;
+
+        emit TokenResumedByProof(messageId, p.soraAssetId);
     }
 
     function _ensure_supported_domain(uint32 domain) internal pure {
@@ -275,5 +281,37 @@ contract SccpRouter {
 
     function _is_evm_domain(uint32 domain) internal pure returns (bool) {
         return domain == DOMAIN_ETH || domain == DOMAIN_BSC || domain == DOMAIN_TRON;
+    }
+
+    function _bytes32ToString(bytes32 raw) internal pure returns (string memory out) {
+        bytes memory b = new bytes(32);
+        uint256 len = 0;
+        uint256 zeroAt = type(uint256).max;
+
+        for (uint256 i = 0; i < 32; i++) {
+            bytes1 c = raw[i];
+            if (c == bytes1(0)) {
+                zeroAt = i;
+                break;
+            }
+            uint8 v = uint8(c);
+            if (v < 0x20 || v > 0x7E) revert TokenMetadataInvalid();
+            b[len] = c;
+            len += 1;
+        }
+
+        if (len == 0) revert TokenMetadataInvalid();
+
+        if (zeroAt != type(uint256).max) {
+            for (uint256 j = zeroAt + 1; j < 32; j++) {
+                if (raw[j] != bytes1(0)) revert TokenMetadataInvalid();
+            }
+        }
+
+        out = new string(len);
+        bytes memory outB = bytes(out);
+        for (uint256 k = 0; k < len; k++) {
+            outB[k] = b[k];
+        }
     }
 }

@@ -19,6 +19,7 @@ solc \
   contracts/SccpToken.sol \
   contracts/SccpCodec.sol \
   contracts/ISccpVerifier.sol \
+  contracts/verifiers/SoraBeefyLightClientVerifier.sol \
   contracts/verifiers/AlwaysFalseVerifier.sol \
   contracts/verifiers/AlwaysTrueVerifier.sol
 

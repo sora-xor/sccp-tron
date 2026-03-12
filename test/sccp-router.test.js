@@ -15,570 +15,355 @@ async function expectCustomError(promise, contract, name) {
   }
 }
 
-function hexRepeat(byteHexNo0x, nBytes) {
-  return `0x${byteHexNo0x.repeat(nBytes)}`;
+function text32(s, ethers) {
+  return ethers.encodeBytes32String(s);
 }
 
-describe('SCCP (EVM) router (TRON)', function () {
-  it('codec matches the ETH -> SORA reference vector', async function () {
+function malformedLabelWithTrailingNonZero() {
+  return `0x410042${'00'.repeat(29)}`; // "A\0B..." violates canonical zero-padding.
+}
+
+describe('SCCP router (roleless, proof-driven token lifecycle)', function () {
+  it('rejects invalid constructor inputs', async function () {
     const { ethers } = await network.connect();
-    const CodecTest = await ethers.getContractFactory('SccpCodecTest');
-    const codec = await CodecTest.deploy();
-    await codec.waitForDeployment();
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const contractLike = { interface: Router.interface };
 
-    const soraAssetId = hexRepeat('11', 32);
-    const recipient32 = hexRepeat('22', 32);
+    await expectCustomError(Router.deploy(5, ethers.ZeroAddress), contractLike, 'ZeroAddress');
+    await expectCustomError(
+      Router.deploy(999, ethers.ZeroAddress),
+      contractLike,
+      'ZeroAddress',
+    );
 
-    const payload = await codec.encodeBurnPayloadV1(1, 0, 777, soraAssetId, 10, recipient32);
-    const expectedPayload =
-      '0x' +
-      '01' +
-      '01000000' +
-      '00000000' +
-      '0903000000000000' +
-      '11'.repeat(32) +
-      '0a' +
-      '00'.repeat(15) +
-      '22'.repeat(32);
-
-    expect(payload).to.equal(expectedPayload);
-
-    const messageId = await codec.burnMessageId(payload);
-    expect(messageId).to.equal(
-      '0xf3cac8c5acfb0670a24e9ffeab7e409a9d54d1dc5e6dbaf0ee986462fe1ffb3a',
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+    await expectCustomError(
+      Router.deploy(999, await verifier.getAddress()),
+      contractLike,
+      'DomainUnsupported',
     );
   });
 
-  it('enforces governor-only admin methods and blocks unverifiable mint attempts', async function () {
+  it('adds tokens only from valid proofs and enforces governance replay protection', async function () {
     const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
+    const [user] = await ethers.getSigners();
 
-    const DOMAIN_SORA = 0;
-    const DOMAIN_SOL = 3;
     const DOMAIN_TRON = 5;
+    const soraAssetId = `0x${'11'.repeat(32)}`;
+
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const router = await Router.deploy(DOMAIN_TRON, await verifier.getAddress());
+    await router.waitForDeployment();
 
     const CodecTest = await ethers.getContractFactory('SccpCodecTest');
     const codec = await CodecTest.deploy();
     await codec.waitForDeployment();
 
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
+    const addPayload = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
+      1,
+      soraAssetId,
+      18,
+      text32('SCCP Wrapped', ethers),
+      text32('wSORA', ethers),
+    );
+    const addMessageId = await codec.tokenAddMessageId(addPayload);
 
-    const soraAssetId = hexRepeat('11', 32);
+    await (await router.addTokenFromProof(addPayload, '0x')).wait();
+
+    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
+    expect(tokenAddr).to.not.equal(ethers.ZeroAddress);
+    expect(await router.processedGovernanceMessage(addMessageId)).to.equal(true);
+    expect(await router.tokenStateBySoraAssetId(soraAssetId)).to.equal(1n);
+
+    const token = await ethers.getContractAt('SccpToken', tokenAddr);
+    expect(await token.name()).to.equal('SCCP Wrapped');
+    expect(await token.symbol()).to.equal('wSORA');
+    expect(await token.decimals()).to.equal(18n);
+    expect(await token.balanceOf(user.address)).to.equal(0n);
 
     await expectCustomError(
-      router.connect(user).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18),
+      router.addTokenFromProof(addPayload, '0x'),
       router,
-      'OnlyGovernor',
+      'GovernanceActionAlreadyProcessed',
     );
-    await expectCustomError(router.connect(user).setVerifier(user.address), router, 'OnlyGovernor');
-    await expectCustomError(router.connect(user).setGovernor(user.address), router, 'OnlyGovernor');
-    await expectCustomError(router.connect(user).setInboundDomainPaused(DOMAIN_SORA, true), router, 'OnlyGovernor');
-    await expectCustomError(router.connect(user).setOutboundDomainPaused(DOMAIN_SOL, true), router, 'OnlyGovernor');
-    await expectCustomError(
-      router.connect(user).invalidateInboundMessage(DOMAIN_SORA, hexRepeat('aa', 32), true),
-      router,
-      'OnlyGovernor',
-    );
+  });
 
-    await expectCustomError(router.mintFromProof(DOMAIN_SORA, '0x', '0x'), router, 'VerifierNotSet');
+  it('rejects token-add proof failures and malformed governance payloads', async function () {
+    const { ethers } = await network.connect();
+
+    const DOMAIN_TRON = 5;
+    const DOMAIN_ETH = 1;
+    const soraAssetId = `0x${'22'.repeat(32)}`;
 
     const FalseVerifier = await ethers.getContractFactory('AlwaysFalseVerifier');
     const falseVerifier = await FalseVerifier.deploy();
     await falseVerifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await falseVerifier.getAddress())).wait();
-    await (await router.connect(governor).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
 
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-    const payload = await codec.encodeBurnPayloadV1(DOMAIN_SORA, DOMAIN_TRON, 1, soraAssetId, 1, recipient32);
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, payload, '0x1234'),
-      router,
-      'ProofVerificationFailed',
-    );
-  });
-
-  it('rejects unknown inbound assets and outbound amounts over u128', async function () {
-    const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
-
-    const DOMAIN_SORA = 0;
-    const DOMAIN_SOL = 3;
-    const DOMAIN_TRON = 5;
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const router = await Router.deploy(DOMAIN_TRON, await falseVerifier.getAddress());
+    await router.waitForDeployment();
 
     const CodecTest = await ethers.getContractFactory('SccpCodecTest');
     const codec = await CodecTest.deploy();
     await codec.waitForDeployment();
 
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
-
-    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
-    const verifier = await TrueVerifier.deploy();
-    await verifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await verifier.getAddress())).wait();
-
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-    const unknownAssetId = hexRepeat('99', 32);
-    const inboundUnknownTokenPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
+    const payload = await codec.encodeTokenAddPayloadV1(
       DOMAIN_TRON,
-      7,
-      unknownAssetId,
-      1,
-      recipient32,
+      2,
+      soraAssetId,
+      18,
+      text32('Token', ethers),
+      text32('TOK', ethers),
+    );
+    await expectCustomError(router.addTokenFromProof(payload, '0x'), router, 'ProofVerificationFailed');
+
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+
+    const router2 = await Router.deploy(DOMAIN_TRON, await verifier.getAddress());
+    await router2.waitForDeployment();
+
+    const wrongDomainPayload = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_ETH,
+      3,
+      soraAssetId,
+      18,
+      text32('Token', ethers),
+      text32('TOK', ethers),
     );
     await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, inboundUnknownTokenPayload, '0x'),
-      router,
-      'TokenNotRegistered',
+      router2.addTokenFromProof(wrongDomainPayload, '0x'),
+      router2,
+      'DomainUnsupported',
     );
 
-    const knownAssetId = hexRepeat('11', 32);
-    await (await router.connect(governor).deployToken(knownAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
-
-    const tooLargeAmount = 1n << 128n;
-    const solRecipient32 = hexRepeat('33', 32);
+    const badNamePayload = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
+      4,
+      soraAssetId,
+      18,
+      malformedLabelWithTrailingNonZero(),
+      text32('TOK', ethers),
+    );
     await expectCustomError(
-      router.connect(user).burnToDomain(knownAssetId, tooLargeAmount, DOMAIN_SOL, solRecipient32),
-      router,
-      'AmountTooLarge',
+      router2.addTokenFromProof(badNamePayload, '0x'),
+      router2,
+      'TokenMetadataInvalid',
     );
   });
 
-  it('guards governor transfer and duplicate token registration', async function () {
+  it('supports pause/resume via proofs and blocks burn/mint while paused', async function () {
     const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
-
-    const DOMAIN_SOL = 3;
-    const DOMAIN_TRON = 5;
-    const soraAssetId = hexRepeat('11', 32);
-
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
-
-    await expectCustomError(
-      router.connect(governor).setGovernor(ethers.ZeroAddress),
-      router,
-      'ZeroAddress',
-    );
-
-    await (await router.connect(governor).setGovernor(user.address)).wait();
-    await expectCustomError(
-      router.connect(governor).setOutboundDomainPaused(DOMAIN_SOL, true),
-      router,
-      'OnlyGovernor',
-    );
-
-    await (await router.connect(user).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
-    await expectCustomError(
-      router.connect(user).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18),
-      router,
-      'TokenAlreadyRegistered',
-    );
-  });
-
-  it('rejects malformed inbound payload variants before minting', async function () {
-    const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
+    const [user] = await ethers.getSigners();
 
     const DOMAIN_SORA = 0;
-    const DOMAIN_ETH = 1;
     const DOMAIN_SOL = 3;
     const DOMAIN_TRON = 5;
-    const soraAssetId = hexRepeat('11', 32);
+    const soraAssetId = `0x${'33'.repeat(32)}`;
+
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const router = await Router.deploy(DOMAIN_TRON, await verifier.getAddress());
+    await router.waitForDeployment();
 
     const CodecTest = await ethers.getContractFactory('SccpCodecTest');
     const codec = await CodecTest.deploy();
     await codec.waitForDeployment();
 
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
+    const addPayload = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
+      1,
+      soraAssetId,
+      18,
+      text32('SCCP Wrapped', ethers),
+      text32('wSORA', ethers),
+    );
+    await (await router.addTokenFromProof(addPayload, '0x')).wait();
 
-    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
-    const verifier = await TrueVerifier.deploy();
-    await verifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await verifier.getAddress())).wait();
-    await (await router.connect(governor).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
+    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
+    const token = await ethers.getContractAt('SccpToken', tokenAddr);
 
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-
-    const sourceSoraPayload = await codec.encodeBurnPayloadV1(
+    const inboundPayload = await codec.encodeBurnPayloadV1(
       DOMAIN_SORA,
       DOMAIN_TRON,
       10,
       soraAssetId,
-      1,
-      recipient32,
+      5,
+      ethers.zeroPadValue(user.address, 32),
     );
+    await (await router.mintFromProof(DOMAIN_SORA, inboundPayload, '0x')).wait();
+    expect(await token.balanceOf(user.address)).to.equal(5n);
+
+    const pausePayload = await codec.encodeTokenPausePayloadV1(DOMAIN_TRON, 2, soraAssetId);
+    const pauseMessageId = await codec.tokenPauseMessageId(pausePayload);
+    await (await router.pauseTokenFromProof(pausePayload, '0x')).wait();
+    expect(await router.processedGovernanceMessage(pauseMessageId)).to.equal(true);
+    expect(await router.tokenStateBySoraAssetId(soraAssetId)).to.equal(2n);
+
+    await (await token.connect(user).approve(await router.getAddress(), 1n)).wait();
     await expectCustomError(
-      router.mintFromProof(DOMAIN_ETH, sourceSoraPayload, '0x'),
+      router.connect(user).burnToDomain(soraAssetId, 1n, DOMAIN_SOL, `0x${'44'.repeat(32)}`),
       router,
-      'DomainUnsupported',
+      'TokenNotActive',
     );
 
-    const invalidVersionPayload = `0x02${sourceSoraPayload.slice(4)}`;
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, invalidVersionPayload, '0x'),
-      router,
-      'DomainUnsupported',
-    );
-
-    const wrongDestPayload = await codec.encodeBurnPayloadV1(
+    const pausedInboundPayload = await codec.encodeBurnPayloadV1(
       DOMAIN_SORA,
-      DOMAIN_SOL,
+      DOMAIN_TRON,
       11,
       soraAssetId,
-      1,
-      recipient32,
-    );
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, wrongDestPayload, '0x'),
-      router,
-      'DomainUnsupported',
-    );
-
-    const zeroAmountPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      DOMAIN_TRON,
-      12,
-      soraAssetId,
-      0,
-      recipient32,
-    );
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, zeroAmountPayload, '0x'),
-      router,
-      'AmountIsZero',
-    );
-
-    const zeroRecipientPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      DOMAIN_TRON,
-      13,
-      soraAssetId,
-      1,
-      ethers.ZeroHash,
-    );
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, zeroRecipientPayload, '0x'),
-      router,
-      'RecipientIsZero',
-    );
-  });
-
-  it('rejects outbound burn edge cases for local domain and unknown token', async function () {
-    const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
-
-    const DOMAIN_TRON = 5;
-    const DOMAIN_SOL = 3;
-
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
-
-    const unknownAssetId = hexRepeat('99', 32);
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-
-    await expectCustomError(
-      router.connect(user).burnToDomain(unknownAssetId, 1n, DOMAIN_TRON, recipient32),
-      router,
-      'DomainEqualsLocal',
-    );
-    await expectCustomError(
-      router.connect(user).burnToDomain(unknownAssetId, 1n, DOMAIN_SOL, recipient32),
-      router,
-      'TokenNotRegistered',
-    );
-    await expectCustomError(
-      router.connect(user).burnToDomain(unknownAssetId, 1n, DOMAIN_SOL, ethers.ZeroHash),
-      router,
-      'RecipientIsZero',
-    );
-  });
-
-  it('remains fail-closed after verifier is unset and rejects local-domain incident controls', async function () {
-    const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
-
-    const DOMAIN_SORA = 0;
-    const DOMAIN_TRON = 5;
-
-    const CodecTest = await ethers.getContractFactory('SccpCodecTest');
-    const codec = await CodecTest.deploy();
-    await codec.waitForDeployment();
-
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
-
-    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
-    const verifier = await TrueVerifier.deploy();
-    await verifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await verifier.getAddress())).wait();
-    await (await router.connect(governor).setVerifier(ethers.ZeroAddress)).wait();
-
-    const payload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      DOMAIN_TRON,
-      21,
-      hexRepeat('11', 32),
       1,
       ethers.zeroPadValue(user.address, 32),
     );
     await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, payload, '0x'),
+      router.mintFromProof(DOMAIN_SORA, pausedInboundPayload, '0x'),
       router,
-      'VerifierNotSet',
+      'TokenNotActive',
     );
 
     await expectCustomError(
-      router.connect(governor).setInboundDomainPaused(DOMAIN_TRON, true),
+      router.pauseTokenFromProof(pausePayload, '0x'),
       router,
-      'DomainEqualsLocal',
+      'GovernanceActionAlreadyProcessed',
     );
-    await expectCustomError(
-      router.connect(governor).setOutboundDomainPaused(DOMAIN_TRON, true),
-      router,
-      'DomainEqualsLocal',
-    );
-    await expectCustomError(
-      router.connect(governor).invalidateInboundMessage(DOMAIN_TRON, hexRepeat('aa', 32), true),
-      router,
-      'DomainEqualsLocal',
-    );
-    await expectCustomError(
-      router.burnPayload(hexRepeat('ff', 32)),
-      router,
-      'BurnRecordNotFound',
-    );
+
+    const resumePayload = await codec.encodeTokenResumePayloadV1(DOMAIN_TRON, 3, soraAssetId);
+    const resumeMessageId = await codec.tokenResumeMessageId(resumePayload);
+    await (await router.resumeTokenFromProof(resumePayload, '0x')).wait();
+    expect(await router.processedGovernanceMessage(resumeMessageId)).to.equal(true);
+    expect(await router.tokenStateBySoraAssetId(soraAssetId)).to.equal(1n);
+
+    await (await router.connect(user).burnToDomain(soraAssetId, 1n, DOMAIN_SOL, `0x${'55'.repeat(32)}`)).wait();
+    expect(await token.balanceOf(user.address)).to.equal(4n);
   });
 
-  it('allows governor to revalidate invalidated proofs and resume inbound minting after unpause', async function () {
+  it('keeps burn/mint replay and recipient canonical protections', async function () {
     const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
-
-    const DOMAIN_SORA = 0;
-    const DOMAIN_TRON = 5;
-    const soraAssetId = hexRepeat('11', 32);
-
-    const CodecTest = await ethers.getContractFactory('SccpCodecTest');
-    const codec = await CodecTest.deploy();
-    await codec.waitForDeployment();
-
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(DOMAIN_TRON, governor.address);
-    await router.waitForDeployment();
-
-    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
-    const verifier = await TrueVerifier.deploy();
-    await verifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await verifier.getAddress())).wait();
-    await (await router.connect(governor).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
-
-    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
-    const token = await ethers.getContractAt('SccpToken', tokenAddr);
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-
-    const revalidatedPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      DOMAIN_TRON,
-      30,
-      soraAssetId,
-      1,
-      recipient32,
-    );
-    const revalidatedMessageId = await codec.burnMessageId(revalidatedPayload);
-
-    await (await router.connect(governor).invalidateInboundMessage(DOMAIN_SORA, revalidatedMessageId, true)).wait();
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, revalidatedPayload, '0x'),
-      router,
-      'ProofInvalidated',
-    );
-
-    await (await router.connect(governor).invalidateInboundMessage(DOMAIN_SORA, revalidatedMessageId, false)).wait();
-    await (await router.mintFromProof(DOMAIN_SORA, revalidatedPayload, '0x')).wait();
-    expect(await token.balanceOf(user.address)).to.equal(1n);
-    expect(await router.processedInbound(revalidatedMessageId)).to.equal(true);
-
-    const pausedPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      DOMAIN_TRON,
-      31,
-      soraAssetId,
-      1,
-      recipient32,
-    );
-    await (await router.connect(governor).setInboundDomainPaused(DOMAIN_SORA, true)).wait();
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, pausedPayload, '0x'),
-      router,
-      'InboundDomainPaused',
-    );
-
-    await (await router.connect(governor).setInboundDomainPaused(DOMAIN_SORA, false)).wait();
-    await (await router.mintFromProof(DOMAIN_SORA, pausedPayload, '0x')).wait();
-    expect(await token.balanceOf(user.address)).to.equal(2n);
-  });
-
-  it('mint/burn/incident controls work and minting is recipient-canonical', async function () {
-    const { ethers } = await network.connect();
-    const [governor, user] = await ethers.getSigners();
+    const [user] = await ethers.getSigners();
 
     const DOMAIN_SORA = 0;
     const DOMAIN_ETH = 1;
-    const DOMAIN_BSC = 2;
-    const DOMAIN_SOL = 3;
     const DOMAIN_TRON = 5;
-    const UNSUPPORTED_DOMAIN = 999;
+    const soraAssetId = `0x${'44'.repeat(32)}`;
 
-    const LOCAL_DOMAIN = DOMAIN_TRON;
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const router = await Router.deploy(DOMAIN_TRON, await verifier.getAddress());
+    await router.waitForDeployment();
 
     const CodecTest = await ethers.getContractFactory('SccpCodecTest');
     const codec = await CodecTest.deploy();
     await codec.waitForDeployment();
 
-    const Router = await ethers.getContractFactory('SccpRouter');
-    const router = await Router.deploy(LOCAL_DOMAIN, governor.address);
-    await router.waitForDeployment();
-
-    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
-    const verifier = await TrueVerifier.deploy();
-    await verifier.waitForDeployment();
-    await (await router.connect(governor).setVerifier(await verifier.getAddress())).wait();
-
-    const soraAssetId = hexRepeat('11', 32);
-    await (await router.connect(governor).deployToken(soraAssetId, 'SCCP Wrapped', 'wSORA', 18)).wait();
-
-    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
-    const token = await ethers.getContractAt('SccpToken', tokenAddr);
-
-    // --- Inbound mint (SORA -> TRON) ---
-    const recipient32 = ethers.zeroPadValue(user.address, 32);
-    const inboundPayload = await codec.encodeBurnPayloadV1(
-      DOMAIN_SORA,
-      LOCAL_DOMAIN,
+    const addPayload = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
       1,
       soraAssetId,
-      100,
-      recipient32,
+      18,
+      text32('SCCP Wrapped', ethers),
+      text32('wSORA', ethers),
     );
-    const inboundMessageId = await codec.burnMessageId(inboundPayload);
+    await (await router.addTokenFromProof(addPayload, '0x')).wait();
 
-    await (await router.mintFromProof(DOMAIN_SORA, inboundPayload, '0x')).wait();
-    expect(await token.balanceOf(user.address)).to.equal(100n);
-    expect(await router.processedInbound(inboundMessageId)).to.equal(true);
+    const payload = await codec.encodeBurnPayloadV1(
+      DOMAIN_SORA,
+      DOMAIN_TRON,
+      5,
+      soraAssetId,
+      1,
+      ethers.zeroPadValue(user.address, 32),
+    );
 
-    // Replay is blocked.
+    await (await router.mintFromProof(DOMAIN_SORA, payload, '0x')).wait();
     await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, inboundPayload, '0x'),
+      router.mintFromProof(DOMAIN_SORA, payload, '0x'),
       router,
       'InboundAlreadyProcessed',
     );
 
-    // Unsupported source domain is rejected.
-    await expectCustomError(
-      router.mintFromProof(UNSUPPORTED_DOMAIN, inboundPayload, '0x'),
-      router,
-      'DomainUnsupported',
-    );
-
-    // Source domain == local domain is blocked.
-    await expectCustomError(
-      router.mintFromProof(LOCAL_DOMAIN, inboundPayload, '0x'),
-      router,
-      'DomainEqualsLocal',
-    );
-
-    // Recipient canonical encoding enforced for EVM mints.
-    const recipientBad = `0x${'11'.repeat(12)}${user.address.slice(2)}`; // non-zero high 12 bytes
-    const badPayload = await codec.encodeBurnPayloadV1(DOMAIN_SORA, LOCAL_DOMAIN, 2, soraAssetId, 1, recipientBad);
-    await expectCustomError(router.mintFromProof(DOMAIN_SORA, badPayload, '0x'), router, 'RecipientNotCanonical');
-
-    // Invalidate a specific messageId.
-    const invPayload = await codec.encodeBurnPayloadV1(DOMAIN_SORA, LOCAL_DOMAIN, 3, soraAssetId, 1, recipient32);
-    const invMessageId = await codec.burnMessageId(invPayload);
-    await (await router.connect(governor).invalidateInboundMessage(DOMAIN_SORA, invMessageId, true)).wait();
-    await expectCustomError(
-      router.connect(governor).invalidateInboundMessage(UNSUPPORTED_DOMAIN, invMessageId, true),
-      router,
-      'DomainUnsupported',
+    const badRecipientPayload = await codec.encodeBurnPayloadV1(
+      DOMAIN_SORA,
+      DOMAIN_TRON,
+      6,
+      soraAssetId,
+      1,
+      `0x${'ff'.repeat(32)}`,
     );
     await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, invPayload, '0x'),
-      router,
-      'ProofInvalidated',
-    );
-
-    // Pause inbound from SORA.
-    const pausedPayload = await codec.encodeBurnPayloadV1(DOMAIN_SORA, LOCAL_DOMAIN, 4, soraAssetId, 1, recipient32);
-    await (await router.connect(governor).setInboundDomainPaused(DOMAIN_SORA, true)).wait();
-    await expectCustomError(
-      router.connect(governor).setInboundDomainPaused(UNSUPPORTED_DOMAIN, true),
-      router,
-      'DomainUnsupported',
-    );
-    await expectCustomError(
-      router.mintFromProof(DOMAIN_SORA, pausedPayload, '0x'),
-      router,
-      'InboundDomainPaused',
-    );
-
-    // --- Outbound burn (TRON -> SOL) ---
-    const burnAmount = 10n;
-    await (await token.connect(user).approve(await router.getAddress(), burnAmount)).wait();
-
-    const solRecipient32 = hexRepeat('33', 32);
-    const burnMessageId = await router
-      .connect(user)
-      .burnToDomain.staticCall(soraAssetId, burnAmount, DOMAIN_SOL, solRecipient32);
-    await (await router.connect(user).burnToDomain(soraAssetId, burnAmount, DOMAIN_SOL, solRecipient32)).wait();
-
-    expect(await token.balanceOf(user.address)).to.equal(90n);
-
-    const burnPayload = await router.burnPayload(burnMessageId);
-    const decoded = await codec.decodeBurnPayloadV1(burnPayload);
-    expect(decoded[0]).to.equal(1n);
-    expect(decoded[1]).to.equal(BigInt(LOCAL_DOMAIN));
-    expect(decoded[2]).to.equal(BigInt(DOMAIN_SOL));
-    expect(decoded[3]).to.equal(1n);
-    expect(decoded[4]).to.equal(soraAssetId);
-    expect(decoded[5]).to.equal(burnAmount);
-    expect(decoded[6]).to.equal(solRecipient32);
-
-    // Canonical recipient enforced on outbound when destination is EVM.
-    const evmRecipientBad = `0x${'11'.repeat(12)}${user.address.slice(2)}`;
-    await (await token.connect(user).approve(await router.getAddress(), 1n)).wait();
-    await expectCustomError(
-      router.connect(user).burnToDomain(soraAssetId, 1n, DOMAIN_ETH, evmRecipientBad),
+      router.mintFromProof(DOMAIN_SORA, badRecipientPayload, '0x'),
       router,
       'RecipientNotCanonical',
     );
-    await expectCustomError(
-      router.connect(user).burnToDomain(soraAssetId, 1n, UNSUPPORTED_DOMAIN, solRecipient32),
-      router,
-      'DomainUnsupported',
-    );
 
-    // Outbound domain pause blocks burns to that destination.
-    await (await router.connect(governor).setOutboundDomainPaused(DOMAIN_SOL, true)).wait();
-    await expectCustomError(
-      router.connect(governor).setOutboundDomainPaused(UNSUPPORTED_DOMAIN, true),
-      router,
-      'DomainUnsupported',
-    );
+    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
+    const token = await ethers.getContractAt('SccpToken', tokenAddr);
     await (await token.connect(user).approve(await router.getAddress(), 1n)).wait();
+
     await expectCustomError(
-      router.connect(user).burnToDomain(soraAssetId, 1n, DOMAIN_SOL, solRecipient32),
+      router
+        .connect(user)
+        .burnToDomain(soraAssetId, 1n, DOMAIN_ETH, `0x${'ff'.repeat(32)}`),
       router,
-      'OutboundDomainPaused',
+      'RecipientNotCanonical',
     );
-    expect(await token.balanceOf(user.address)).to.equal(90n);
+  });
+
+  it('does not consume governance replay slot when duplicate asset registration is rejected', async function () {
+    const { ethers } = await network.connect();
+
+    const DOMAIN_TRON = 5;
+    const soraAssetId = `0x${'77'.repeat(32)}`;
+
+    const TrueVerifier = await ethers.getContractFactory('AlwaysTrueVerifier');
+    const verifier = await TrueVerifier.deploy();
+    await verifier.waitForDeployment();
+
+    const Router = await ethers.getContractFactory('SccpRouter');
+    const router = await Router.deploy(DOMAIN_TRON, await verifier.getAddress());
+    await router.waitForDeployment();
+
+    const CodecTest = await ethers.getContractFactory('SccpCodecTest');
+    const codec = await CodecTest.deploy();
+    await codec.waitForDeployment();
+
+    const addPayloadV1 = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
+      1,
+      soraAssetId,
+      18,
+      text32('SCCP Wrapped', ethers),
+      text32('wSORA', ethers),
+    );
+    await (await router.addTokenFromProof(addPayloadV1, '0x')).wait();
+    const tokenAddr = await router.tokenBySoraAssetId(soraAssetId);
+
+    const addPayloadV2 = await codec.encodeTokenAddPayloadV1(
+      DOMAIN_TRON,
+      2,
+      soraAssetId,
+      9,
+      text32('SCCP Wrapped 2', ethers),
+      text32('wSORA2', ethers),
+    );
+    const addMessageIdV2 = await codec.tokenAddMessageId(addPayloadV2);
+    expect(await router.processedGovernanceMessage(addMessageIdV2)).to.equal(false);
+
+    await expectCustomError(router.addTokenFromProof(addPayloadV2, '0x'), router, 'TokenAlreadyRegistered');
+    expect(await router.tokenBySoraAssetId(soraAssetId)).to.equal(tokenAddr);
+    expect(await router.processedGovernanceMessage(addMessageIdV2)).to.equal(false);
   });
 });

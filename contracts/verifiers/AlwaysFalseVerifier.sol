@@ -13,5 +13,16 @@ contract AlwaysFalseVerifier is ISccpVerifier {
     ) external pure returns (bool) {
         return false;
     }
-}
 
+    function verifyTokenAddProof(bytes32, bytes calldata, bytes calldata) external pure returns (bool) {
+        return false;
+    }
+
+    function verifyTokenPauseProof(bytes32, bytes calldata, bytes calldata) external pure returns (bool) {
+        return false;
+    }
+
+    function verifyTokenResumeProof(bytes32, bytes calldata, bytes calldata) external pure returns (bool) {
+        return false;
+    }
+}

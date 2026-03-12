@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: BSD-4-Clause
 pragma solidity ^0.8.23;
 
-/// @notice SCALE codec helpers for SCCP burn payloads.
-///
-/// SCCP message id on all chains is:
-/// `keccak256(b"sccp:burn:v1" || SCALE(BurnPayloadV1))`.
+/// @notice SCALE codec helpers for SCCP payloads.
 library SccpCodec {
     bytes internal constant SCCP_MSG_PREFIX_BURN_V1 = "sccp:burn:v1";
+    bytes internal constant SCCP_MSG_PREFIX_TOKEN_ADD_V1 = "sccp:token:add:v1";
+    bytes internal constant SCCP_MSG_PREFIX_TOKEN_PAUSE_V1 = "sccp:token:pause:v1";
+    bytes internal constant SCCP_MSG_PREFIX_TOKEN_RESUME_V1 = "sccp:token:resume:v1";
+
     uint256 internal constant BURN_PAYLOAD_V1_LEN = 97;
+    uint256 internal constant TOKEN_ADD_PAYLOAD_V1_LEN = 110;
+    uint256 internal constant TOKEN_CONTROL_PAYLOAD_V1_LEN = 45;
 
     error InvalidPayloadLength(uint256 len);
 
@@ -21,8 +24,37 @@ library SccpCodec {
         bytes32 recipient;
     }
 
+    struct TokenAddPayloadV1 {
+        uint8 version;
+        uint32 targetDomain;
+        uint64 nonce;
+        bytes32 soraAssetId;
+        uint8 decimals;
+        bytes32 name;
+        bytes32 symbol;
+    }
+
+    struct TokenControlPayloadV1 {
+        uint8 version;
+        uint32 targetDomain;
+        uint64 nonce;
+        bytes32 soraAssetId;
+    }
+
     function burnMessageId(bytes memory payload) internal pure returns (bytes32) {
         return keccak256(bytes.concat(SCCP_MSG_PREFIX_BURN_V1, payload));
+    }
+
+    function tokenAddMessageId(bytes memory payload) internal pure returns (bytes32) {
+        return keccak256(bytes.concat(SCCP_MSG_PREFIX_TOKEN_ADD_V1, payload));
+    }
+
+    function tokenPauseMessageId(bytes memory payload) internal pure returns (bytes32) {
+        return keccak256(bytes.concat(SCCP_MSG_PREFIX_TOKEN_PAUSE_V1, payload));
+    }
+
+    function tokenResumeMessageId(bytes memory payload) internal pure returns (bytes32) {
+        return keccak256(bytes.concat(SCCP_MSG_PREFIX_TOKEN_RESUME_V1, payload));
     }
 
     function encodeBurnPayloadV1(BurnPayloadV1 memory p) internal pure returns (bytes memory payload) {
@@ -36,6 +68,29 @@ library SccpCodec {
         _writeBytes32(payload, 65, p.recipient);
     }
 
+    function encodeTokenAddPayloadV1(TokenAddPayloadV1 memory p) internal pure returns (bytes memory payload) {
+        payload = new bytes(TOKEN_ADD_PAYLOAD_V1_LEN);
+        payload[0] = bytes1(p.version);
+        _writeLE32(payload, 1, p.targetDomain);
+        _writeLE64(payload, 5, p.nonce);
+        _writeBytes32(payload, 13, p.soraAssetId);
+        payload[45] = bytes1(p.decimals);
+        _writeBytes32(payload, 46, p.name);
+        _writeBytes32(payload, 78, p.symbol);
+    }
+
+    function encodeTokenPausePayloadV1(TokenControlPayloadV1 memory p) internal pure returns (bytes memory payload) {
+        payload = new bytes(TOKEN_CONTROL_PAYLOAD_V1_LEN);
+        payload[0] = bytes1(p.version);
+        _writeLE32(payload, 1, p.targetDomain);
+        _writeLE64(payload, 5, p.nonce);
+        _writeBytes32(payload, 13, p.soraAssetId);
+    }
+
+    function encodeTokenResumePayloadV1(TokenControlPayloadV1 memory p) internal pure returns (bytes memory payload) {
+        payload = encodeTokenPausePayloadV1(p);
+    }
+
     function decodeBurnPayloadV1(bytes calldata payload) internal pure returns (BurnPayloadV1 memory p) {
         if (payload.length != BURN_PAYLOAD_V1_LEN) revert InvalidPayloadLength(payload.length);
         p.version = uint8(payload[0]);
@@ -45,6 +100,29 @@ library SccpCodec {
         p.soraAssetId = _readBytes32(payload, 17);
         p.amount = _readLE128(payload, 49);
         p.recipient = _readBytes32(payload, 65);
+    }
+
+    function decodeTokenAddPayloadV1(bytes calldata payload) internal pure returns (TokenAddPayloadV1 memory p) {
+        if (payload.length != TOKEN_ADD_PAYLOAD_V1_LEN) revert InvalidPayloadLength(payload.length);
+        p.version = uint8(payload[0]);
+        p.targetDomain = _readLE32(payload, 1);
+        p.nonce = _readLE64(payload, 5);
+        p.soraAssetId = _readBytes32(payload, 13);
+        p.decimals = uint8(payload[45]);
+        p.name = _readBytes32(payload, 46);
+        p.symbol = _readBytes32(payload, 78);
+    }
+
+    function decodeTokenPausePayloadV1(bytes calldata payload) internal pure returns (TokenControlPayloadV1 memory p) {
+        if (payload.length != TOKEN_CONTROL_PAYLOAD_V1_LEN) revert InvalidPayloadLength(payload.length);
+        p.version = uint8(payload[0]);
+        p.targetDomain = _readLE32(payload, 1);
+        p.nonce = _readLE64(payload, 5);
+        p.soraAssetId = _readBytes32(payload, 13);
+    }
+
+    function decodeTokenResumePayloadV1(bytes calldata payload) internal pure returns (TokenControlPayloadV1 memory p) {
+        p = decodeTokenPausePayloadV1(payload);
     }
 
     function _writeBytes32(bytes memory b, uint256 off, bytes32 v) private pure {
@@ -117,9 +195,9 @@ library SccpCodec {
     }
 
     function _readLE128(bytes calldata b, uint256 off) private pure returns (uint128 v) {
-        // Loop keeps compiler stack usage low compared to a giant OR expression.
         for (uint256 i = 0; i < 16; i++) {
             v |= uint128(uint256(uint8(b[off + i])) << (8 * i));
         }
     }
+
 }

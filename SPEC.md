@@ -1,6 +1,6 @@
 # SCCP Message Format (v1)
 
-This repo follows the SCCP message format pinned by the SORA runtime pallet `sccp`.
+This repo follows SCCP message conventions pinned by the SORA runtime pallet `sccp`.
 
 ## Domains
 
@@ -14,7 +14,6 @@ This repo follows the SCCP message format pinned by the SORA runtime pallet `scc
 ## BurnPayloadV1
 
 Fields (in order):
-
 1. `version: u8` (must be `1`)
 2. `source_domain: u32` (little-endian)
 3. `dest_domain: u32` (little-endian)
@@ -23,68 +22,76 @@ Fields (in order):
 6. `amount: u128` (little-endian)
 7. `recipient: [u8; 32]`
 
-Encoding: Substrate SCALE encoding for fixed-width primitives (no compact encoding is used here).
-
 Total encoded length: `97` bytes.
 
-## messageId
+## TokenAddPayloadV1
 
-On all chains, the canonical message id is:
+Fields (in order):
+1. `version: u8` (must be `1`)
+2. `target_domain: u32` (little-endian)
+3. `nonce: u64` (little-endian)
+4. `sora_asset_id: [u8; 32]`
+5. `decimals: u8`
+6. `name: [u8; 32]` (zero-padded printable ASCII)
+7. `symbol: [u8; 32]` (zero-padded printable ASCII)
 
-`messageId = keccak256(b"sccp:burn:v1" || payload_scale_bytes)`
+Total encoded length: `110` bytes.
 
-Where `payload_scale_bytes` is the SCALE encoding of `BurnPayloadV1`.
+## TokenPausePayloadV1 / TokenResumePayloadV1
+
+Fields (in order):
+1. `version: u8` (must be `1`)
+2. `target_domain: u32` (little-endian)
+3. `nonce: u64` (little-endian)
+4. `sora_asset_id: [u8; 32]`
+
+Total encoded length: `45` bytes.
+
+## Message IDs
+
+Canonical IDs are:
+- Burn: `keccak256("sccp:burn:v1" || burn_payload_bytes)`
+- Token add: `keccak256("sccp:token:add:v1" || token_add_payload_bytes)`
+- Token pause: `keccak256("sccp:token:pause:v1" || token_pause_payload_bytes)`
+- Token resume: `keccak256("sccp:token:resume:v1" || token_resume_payload_bytes)`
 
 ## Recipient Encoding
 
-`recipient` is always 32 bytes. Each chain interprets it differently:
-
-- EVM (ETH/BSC/TRON): `address` right-aligned (last 20 bytes), i.e. `address(uint160(uint256(recipient)))`.
-  - Canonical encoding is enforced on-chain: the top 12 bytes must be zero and the address must be non-zero.
-- Solana: 32-byte ed25519 public key
-- TON: 32-byte address/public-key representation (project-specific; must be consistent across contracts and off-chain tooling)
-
-## Remote Token IDs (stored on SORA)
-
-When SORA governance adds an SCCP token, it stores each remote representation id:
-
-- EVM (ETH/BSC/TRON): 20 bytes (contract address)
-- Solana: 32 bytes (mint)
-- TON: 32 bytes (jetton master)
+`recipient` is always 32 bytes:
+- EVM (ETH/BSC/TRON): right-aligned 20-byte address.
+- EVM canonical constraints on router:
+  - high 12 bytes must be zero,
+  - address must be non-zero.
+- Solana / TON: project-specific 32-byte representation.
 
 ## BEEFY Validator Merkle Proofs (SORA -> EVM)
 
-The EVM verifier contract (`SoraBeefyLightClientVerifier`) is a BEEFY+MMR light client.
+When importing a BEEFY commitment, signers prove membership in validator set root:
+- leaf: `keccak256(bytes20(validator_eth_address))`
+- parent: `keccak256(left || right)`
+- odd leaf promotion unchanged
 
-When importing a BEEFY commitment, signers must prove membership in the current validator set
-using the `nextAuthoritySetRoot` merkle root from the SORA MMR leaf.
+Verifier checks:
+- threshold signatures (`>=2/3`),
+- valid positions and membership proofs,
+- duplicate signer/public-key rejection,
+- ECDSA low-`s` and non-zero `r,s`.
 
-Root construction matches Substrate `binary_merkle_tree` (no sorting):
+## Unified Proof Envelope
 
-- Leaves: `leaf = keccak256(bytes20(validator_eth_address))`
-- Internal nodes: `parent = keccak256(left || right)`
-- Odd leaf promotion: if a layer has an odd number of nodes, the last node is promoted unchanged
+Burn and governance action verifications consume:
 
-Each signature includes:
+`abi.encode(uint64 leafIndex, uint64 leafCount, bytes32[] items, MmrLeaf leaf, bytes digestScale)`
 
-- `position`: validator leaf index (0-based) in the set order used by the chain
-- `publicKeyMerkleProofs[position]`: sibling hashes along the path (one per tree level where a sibling exists)
-- ECDSA signature validity rules: `r != 0`, `s != 0`, and `s <= secp256k1n / 2` (reject high-`s` malleability)
-- duplicate signer keys are rejected in one commitment proof (fail-closed)
+Where:
+- `leaf.digestHash == keccak256(digestScale)`
+- `digestScale` includes exactly one SCCP commitment hash (`messageId`)
+- MMR root derived from `(leaf, proof items)` must be known/imported.
 
-## Proofs To SORA Finality (TRON Source)
+## Router Lifecycle Rules
 
-For inbound TRON -> SORA verification, SORA runtime supports:
-
-- `InboundFinalityMode::TronLightClient` (trustless): on-chain TRON header verifier + solidified-block finality (>70% distinct witnesses)
-  + EVM MPT account/storage proof against the finalized header's execution root (`accountStateRoot`)
-- `InboundFinalityMode::EvmAnchor` (fallback/temporary, governance override): EVM MPT proof against a governance-provided anchor `state_root`
-- `InboundFinalityMode::AttesterQuorum` (fallback/temporary): threshold ECDSA signatures over `keccak256("sccp:attest:v1" || messageId)`
-
-Required SORA governance configuration:
-
-- `set_inbound_finality_mode(DOMAIN_TRON, EvmAnchor)`
-- `set_evm_anchor_mode_enabled(DOMAIN_TRON, true)`
-- `set_evm_inbound_anchor(DOMAIN_TRON, block_number, block_hash, state_root)`
-
-To enable trustless mode, SORA governance must initialize the TRON light client and switch the domain finality mode.
+- Token is created only via proven `TokenAddPayloadV1`.
+- Token pause/resume only via proven `TokenPausePayloadV1` / `TokenResumePayloadV1`.
+- Paused token blocks both outbound burn and inbound mint.
+- Governance action replay protection uses message-id uniqueness.
+- Burn replay protection remains per burn message-id.

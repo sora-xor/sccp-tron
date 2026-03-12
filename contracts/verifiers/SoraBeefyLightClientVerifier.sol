@@ -37,10 +37,6 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
 
     uint32 public constant MMR_ROOT_HISTORY_SIZE = 30;
 
-    error ZeroAddress();
-    error OnlyGovernor();
-    error AlreadyInitialized();
-    error NotInitialized();
     error InvalidValidatorSetId();
     error PayloadBlocknumberTooOld();
     error NotEnoughValidatorSignatures();
@@ -50,7 +46,6 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
     error InvalidMMRProof();
     error OnlySelf();
 
-    event GovernorSet(address indexed governor);
     event Initialized(uint64 latestBeefyBlock, uint64 currentValidatorSetId, uint64 nextValidatorSetId);
     event NewMMRRoot(bytes32 indexed mmrRoot, uint64 blockNumber);
     event ValidatorSetsUpdated(uint64 currentId, uint64 nextId);
@@ -103,9 +98,6 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
         bytes32 digestHash;
     }
 
-    address public governor;
-    bool public initialized;
-
     uint64 public latestBeefyBlock;
 
     ValidatorSet public currentValidatorSet;
@@ -115,33 +107,13 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
     uint256 public mmrRootsPos;
     mapping(bytes32 => bool) public knownMmrRoot;
 
-    modifier onlyGovernor() {
-        if (msg.sender != governor) revert OnlyGovernor();
-        _;
-    }
-
-    constructor(address governor_) {
-        if (governor_ == address(0)) revert ZeroAddress();
-        governor = governor_;
-        emit GovernorSet(governor_);
-    }
-
-    function setGovernor(address newGovernor) external onlyGovernor {
-        if (newGovernor == address(0)) revert ZeroAddress();
-        governor = newGovernor;
-        emit GovernorSet(newGovernor);
-    }
-
-    /// @notice One-time light client bootstrap (governance).
+    /// @notice Constructor bootstrap for the BEEFY light client.
     ///
     /// The initial validator sets and `latestBeefyBlock` must be sourced from SORA chain state.
-    function initialize(
-        uint64 latestBeefyBlock_,
-        ValidatorSet calldata current_,
-        ValidatorSet calldata next_
-    ) external onlyGovernor {
-        if (initialized) revert AlreadyInitialized();
-        initialized = true;
+    constructor(uint64 latestBeefyBlock_, ValidatorSet memory current_, ValidatorSet memory next_) {
+        if (current_.len == 0 || next_.len == 0) revert InvalidValidatorProof();
+        if (current_.root == bytes32(0) || next_.root == bytes32(0)) revert InvalidValidatorProof();
+        if (next_.id <= current_.id) revert InvalidValidatorSetId();
         latestBeefyBlock = latestBeefyBlock_;
         currentValidatorSet = current_;
         nextValidatorSet = next_;
@@ -156,8 +128,6 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
         MmrLeaf calldata latestMmrLeaf,
         MmrProof calldata proof
     ) external {
-        if (!initialized) revert NotInitialized();
-
         // Basic freshness check (fail fast).
         if (uint64(commitment.blockNumber) <= latestBeefyBlock) revert PayloadBlocknumberTooOld();
 
@@ -207,18 +177,47 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
         // SORA has committed `messageId` into its auxiliary digest (BEEFY+MMR finalized).
         // It therefore supports SCCP burns from any source domain, as long as SORA committed them.
         sourceDomain;
-        if (!initialized) return false;
         if (SccpCodec.burnMessageId(payload) != messageId) return false;
+        return _verifyMessageProof(messageId, proof);
+    }
 
+    function verifyTokenAddProof(bytes32 messageId, bytes calldata payload, bytes calldata proof)
+        external
+        view
+        returns (bool)
+    {
+        if (SccpCodec.tokenAddMessageId(payload) != messageId) return false;
+        return _verifyMessageProof(messageId, proof);
+    }
+
+    function verifyTokenPauseProof(bytes32 messageId, bytes calldata payload, bytes calldata proof)
+        external
+        view
+        returns (bool)
+    {
+        if (SccpCodec.tokenPauseMessageId(payload) != messageId) return false;
+        return _verifyMessageProof(messageId, proof);
+    }
+
+    function verifyTokenResumeProof(bytes32 messageId, bytes calldata payload, bytes calldata proof)
+        external
+        view
+        returns (bool)
+    {
+        if (SccpCodec.tokenResumeMessageId(payload) != messageId) return false;
+        return _verifyMessageProof(messageId, proof);
+    }
+
+    function _verifyMessageProof(bytes32 messageId, bytes calldata proofBytes) internal view returns (bool) {
         // Keep this function non-reverting by catching decode errors.
-        try this._verifyBurnProofInternal(messageId, proof) returns (bool ok) {
+        try this._verifyMessageProofInternal(messageId, proofBytes) returns (bool ok) {
             return ok;
         } catch {
             return false;
         }
     }
 
-    function _verifyBurnProofInternal(bytes32 messageId, bytes calldata proofBytes) external view returns (bool) {
+    function _verifyMessageProofInternal(bytes32 messageId, bytes calldata proofBytes) external view returns (bool) {
         if (msg.sender != address(this)) revert OnlySelf();
 
         (uint64 leafIndex, uint64 leafCount, bytes32[] memory items, MmrLeaf memory leaf, bytes memory digestScale) =
@@ -529,6 +528,7 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
         ValidatorSet memory vset
     ) internal pure {
         uint32 num = vset.len;
+        if (num == 0) revert InvalidValidatorProof();
         uint32 threshold = num - (num - 1) / 3; // >=2/3
 
         uint256 n = proof.signatures.length;
@@ -678,7 +678,8 @@ contract SoraBeefyLightClientVerifier is ISccpVerifier {
             }
         }
 
-        return found == 1;
+        // SCALE vectors must be consumed exactly; reject trailing bytes.
+        return found == 1 && off == digestScale.length;
     }
 
     function _readCompactU32(bytes memory data, uint256 off) internal pure returns (uint256 v, uint256 newOff, bool ok) {
